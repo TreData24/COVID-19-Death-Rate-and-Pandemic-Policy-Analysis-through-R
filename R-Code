@@ -1,0 +1,452 @@
+### Appendices 
+```{r}
+## Step 1: Load Packages
+
+# Load required libraries
+library(COVID19)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(zoo)
+library(broom)
+library(pROC)
+library(fmsb)
+library(scales)
+```
+
+Step 2: Aggregation of Level 1 and Level 3 Data
+```{r}
+############################################################
+##Level 1: Mortality and Population 
+############################################################
+
+lvl1 <- covid19(level = 1, verbose = FALSE) %>%
+  mutate(date_formatted = as.Date(date, origin = "1970-01-01"))
+
+lvl1_totals <- lvl1 %>%
+  group_by(iso_alpha_3, administrative_area_level_1) %>%
+  summarise(
+    deaths = max(deaths, na.rm = TRUE),
+    population = max(population, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    deaths = ifelse(is.infinite(deaths), 0, deaths),
+    population = ifelse(is.infinite(population), 1, population),
+    deaths_per_million = (deaths / population) * 1e6
+  )
+
+
+############################################################
+## Level 3: Vaccinations + Policies 
+############################################################
+
+lvl3 <- covid19(level = 3, verbose = FALSE) %>%
+  mutate(date_formatted = as.Date(date, origin = "1970-01-01"))
+
+lvl3_totals <- lvl3 %>%
+  group_by(iso_alpha_3, administrative_area_level_1) %>%
+  summarise(
+    vaccines = max(vaccines, na.rm = TRUE),
+    vaccination_policy = max(vaccination_policy, na.rm = TRUE),
+    internal_movement_restrictions = max(internal_movement_restrictions, na.rm = TRUE),
+    elderly_people_protection = max(elderly_people_protection, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(everything(), ~ ifelse(is.infinite(.), 0, .)))
+
+############################################################
+## Data exploration lvl 1+2 
+############################################################
+
+cat("=== BASIC DATA EXPLORATION (Level 1) ===\n")
+cat("Dimensions:", dim(lvl1), "\n")
+cat("Date range:", min(lvl1$date_formatted), "to", max(lvl1$date_formatted), "\n")
+cat("Countries:", length(unique(lvl1$administrative_area_level_1)), "\n")
+cat("Regions:", length(unique(lvl1$id)), "\n")
+
+cat("\n=== BASIC DATA EXPLORATION (Level 3) ===\n")
+cat("Dimensions:", dim(lvl3), "\n")
+cat("Countries:", length(unique(lvl3$administrative_area_level_1)), "\n")
+
+
+############################################################
+## Merge Levels 1 + 3 
+############################################################
+
+merged <- lvl1_totals %>%
+  inner_join(lvl3_totals, by = c("iso_alpha_3","administrative_area_level_1")) %>%
+  mutate(
+    vaccine_coverage = (vaccines / population) * 100,
+    log_deaths_per_million = log(deaths_per_million)
+  )
+
+merged$log_deaths_per_million[is.infinite(merged$log_deaths_per_million)] <- NA
+
+
+```
+
+
+Step 3: Data Cleaning
+
+```{r}
+model_df <- merged %>%
+  filter(population > 1e6, deaths > 100) %>%
+  mutate(
+    vaccination_policy = ifelse(is.na(vaccination_policy), 0, vaccination_policy),
+    internal_movement_restrictions = ifelse(is.na(internal_movement_restrictions), 0, internal_movement_restrictions),
+    elderly_people_protection = ifelse(is.na(elderly_people_protection), 0, elderly_people_protection)
+  ) %>%
+  filter(!is.na(log_deaths_per_million)) %>%
+  distinct(iso_alpha_3, .keep_all = TRUE)
+
+cat("Rows in cleaned modeling dataset:", nrow(model_df), "\n")
+
+
+```
+
+
+Step 4: Determine Top  vs Bottom  Mortality Countries
+```{r}
+############################################################
+## Define Top 10 vs Bottom 10 Mortality Countries
+############################################################
+
+top10 <- model_df %>%
+  arrange(desc(deaths)) %>%
+  slice(1:10)
+
+bottom10 <- model_df %>%
+  arrange(deaths) %>%
+  slice(1:10)
+
+combined <- bind_rows(
+  top10 %>% mutate(group = "Top10"),
+  bottom10 %>% mutate(group = "Bottom10")
+)
+
+combined
+
+############################################################
+##  Time Series Data
+############################################################
+
+ts1 <- covid19(level = 1, verbose = FALSE) %>%
+  mutate(date_formatted = as.Date(date, origin = "1970-01-01")) %>%
+  filter(iso_alpha_3 %in% combined$iso_alpha_3)
+
+ts_country <- ts1 %>%
+  group_by(iso_alpha_3, administrative_area_level_1, date_formatted) %>%
+  summarise(deaths = max(deaths, na.rm = TRUE), .groups = "drop") %>%
+  mutate(deaths = ifelse(is.infinite(deaths), 0, deaths))
+
+ts_daily <- ts_country %>%
+  group_by(iso_alpha_3, administrative_area_level_1) %>%
+  arrange(date_formatted) %>%
+  mutate(
+    daily_deaths = pmax(deaths - lag(deaths, default = 0), 0),
+    daily_deaths_ma = zoo::rollmean(daily_deaths, 7, fill = NA)
+  ) %>%
+  ungroup()
+
+ts_plot_df <- ts_daily %>%
+  inner_join(combined %>% select(iso_alpha_3, group), by="iso_alpha_3")
+
+############################################################
+##  Plots
+############################################################
+ggplot(combined, aes(x = reorder(iso_alpha_3, deaths), y = deaths,
+                     fill = group)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "COVID-19 Mortality: Top vs Bottom Countries",
+       x = "Country",
+       y = "Total COVID Deaths") +
+  theme_minimal()
+
+```
+
+Step 5: Time Series Plot (Top vs Bottom)
+
+```{r}
+############################################################
+## Split into Top and Bottom datasets for plotting
+############################################################
+
+ts_top10 <- ts_plot_df %>%
+  filter(group == "Top10")
+
+ts_bottom10 <- ts_plot_df %>%
+  filter(group == "Bottom10")
+
+# === Variant markers ===
+variant_dates <- data.frame(
+  date = as.Date(c("2020-11-15", "2021-04-01", "2021-11-25")),
+  label = c("Alpha Emerges", "Delta Emerges", "Omicron Emerges")
+)
+
+
+##############################
+##  Plot: Top Countries  
+##############################
+ggplot(ts_top10, aes(date_formatted, daily_deaths_ma,
+                     color = administrative_area_level_1)) +
+  geom_line(size = 1.0) +
+  
+  geom_vline(data = variant_dates, aes(xintercept = date),
+             linetype="dashed", color="gray40") +
+  geom_text(data = variant_dates,
+            aes(x = date,
+                y = max(ts_top10$daily_deaths_ma, na.rm = TRUE)*0.90,
+                label = label),
+            angle = 90, vjust = -0.5, hjust = 0, color="black", size=3) +
+  
+  labs(title = "COVID-19 Mortality (7-Day Avg) — Top Countries",
+       y = "Daily Deaths (7-day Avg)", x = "Date") +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(size = 16, face="bold"),
+    axis.title = element_text(size = 14)
+  )
+
+
+##############################
+##  Plot: Bottom Countries 
+##############################
+ggplot(ts_bottom10, aes(date_formatted, daily_deaths_ma,
+                        color = administrative_area_level_1)) +
+  geom_line(size = 1.0) +
+  
+  geom_vline(data = variant_dates, aes(xintercept = date),
+             linetype="dashed", color="gray40") +
+  geom_text(data = variant_dates,
+            aes(x = date,
+                y = max(ts_bottom10$daily_deaths_ma, na.rm = TRUE)*0.90,
+                label = label),
+            angle = 90, vjust = -0.5, hjust = 0, color="black", size=3) +
+  
+  labs(title = "COVID-19 Mortality (7-Day Avg) — Bottom Countries",
+       y = "Daily Deaths (7-day Avg)", x = "Date") +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(size = 16, face="bold"),
+    axis.title = element_text(size = 14)
+  )
+
+```
+
+```{r, fig.width=9, fig.height=6}
+
+bubble_df <- combined %>%
+  mutate(
+    policy_total = vaccination_policy +
+                    internal_movement_restrictions +
+                    elderly_people_protection
+  )
+
+ggplot(bubble_df, aes(
+  x = policy_total,
+  y = deaths_per_million,
+  size = vaccine_coverage,
+  color = group
+)) +
+  geom_point(alpha = 0.7) +
+  scale_size(range = c(4, 14), name = "Vaccine Coverage") +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Policy Strength vs COVID Mortality (Bubble size = Vaccination Coverage)",
+    x = "Policy Strength Score",
+    y = "COVID-19 Deaths per Million",
+    color = "Mortality Group"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+```
+
+
+COVID Policy Strength Visualization
+```{r}
+############################################################
+
+## COVID Policy Strength Visualization
+
+############################################################
+
+policy_plot_df <- combined %>%
+select(iso_alpha_3, group,
+vaccination_policy,
+internal_movement_restrictions,
+elderly_people_protection) %>%
+mutate(policy_total =
+vaccination_policy +
+internal_movement_restrictions +
+elderly_people_protection)
+
+ggplot(policy_plot_df,
+aes(x = reorder(iso_alpha_3, policy_total),
+y = policy_total,
+fill = group)) +
+geom_col() +
+coord_flip() +
+theme_minimal() +
+labs(title="COVID-19 Policy Scores by Country (Top 10 vs Bottom 10)",
+x="Country",
+y="Policy Strength Score (Sum of 3 Categories)",
+fill="Mortality Group")
+
+```
+
+
+
+Step 6: Multivariate Regression + CI Plot
+
+```{r}
+############################################################
+## STEP 6 — Build Modeling Dataset from Top+Bottom)
+############################################################
+
+reg_data <- combined %>%
+  select(
+    iso_alpha_3, administrative_area_level_1,
+    deaths_per_million, log_deaths_per_million,
+    vaccine_coverage, vaccination_policy,
+    internal_movement_restrictions,
+    elderly_people_protection
+  ) %>%
+  mutate(
+    vaccination_policy = replace(vaccination_policy, is.na(vaccination_policy), 0),
+    internal_movement_restrictions = replace(internal_movement_restrictions, is.na(internal_movement_restrictions), 0),
+    elderly_people_protection = replace(elderly_people_protection, is.na(elderly_people_protection), 0),
+    log_deaths_per_million = replace(log_deaths_per_million,
+                                     is.infinite(log_deaths_per_million), NA)
+  ) %>%
+  filter(!is.na(log_deaths_per_million)) %>%
+  distinct(iso_alpha_3, .keep_all = TRUE)
+
+
+```
+
+Step 6b. SCALING + REGRESSION
+```{r}
+
+reg_data_model <- reg_data %>%
+  select(log_deaths_per_million,
+         vaccine_coverage,
+         internal_movement_restrictions,
+         elderly_people_protection)
+
+reg_data_scaled <- reg_data_model %>%
+  mutate(across(c(vaccine_coverage,
+                  internal_movement_restrictions,
+                  elderly_people_protection),
+                scale, .names="z_{.col}"))
+
+model_lm <- lm(
+  log_deaths_per_million ~ 
+    z_vaccine_coverage +
+    z_internal_movement_restrictions +
+    z_elderly_people_protection,
+  data = reg_data_scaled
+)
+
+summary(model_lm)
+
+```
+```{r}
+reg_results <- broom::tidy(model_lm, conf.int = TRUE)
+
+ggplot(reg_results, aes(x = reorder(term, estimate), y = estimate)) +
+  geom_point(size=3, color="blue") +
+  geom_errorbar(aes(ymin=conf.low, ymax=conf.high), width=.2) +
+  geom_hline(yintercept=0, linetype="dashed") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title="Regression Coefficients (95% CI)",
+       x="Predictor", y="Effect Size")
+
+```
+
+```{r}
+summary(model_lm)
+
+summary(reg_data %>%
+        select(vaccine_coverage,
+               vaccination_policy,
+               internal_movement_restrictions,
+               elderly_people_protection))
+
+
+```
+
+
+Step 7: Scatterplot (Coverage vs Mortality)
+```{r}
+ggplot(model_df, aes(vaccine_coverage, deaths_per_million)) +
+geom_point(alpha=0.6) +
+geom_smooth(method="lm", se=TRUE, color="red") +
+scale_y_continuous(labels=comma) +
+theme_minimal() +
+labs(title="Deaths per Million vs Vaccine Coverage",
+x="Vaccine Coverage (%)", y="Deaths per Million")
+
+```
+
+Step 8: Classification + ROC Curve
+
+```{r}
+############################################################
+## Step 8: Classification + ROC Curve  (SAFE VERSION)
+############################################################
+
+class_df <- model_df %>%
+  inner_join(combined %>% select(iso_alpha_3, group),
+             by = "iso_alpha_3") %>%
+  mutate(high_mortality = if_else(group=="Top10", 1, 0))
+
+class_df <- class_df %>%
+  filter(!is.na(vaccine_coverage),
+         !is.na(internal_movement_restrictions),
+         !is.na(elderly_people_protection))
+
+cat("Count Top10:", sum(class_df$high_mortality == 1), "\n")
+cat("Count Bottom10:", sum(class_df$high_mortality == 0), "\n")
+
+if (length(unique(class_df$high_mortality)) == 2) {
+
+  logit_mod <- glm(
+    high_mortality ~ vaccine_coverage +
+      internal_movement_restrictions +
+      elderly_people_protection,
+    data = class_df,
+    family = binomial()
+  )
+
+  class_df$pred_prob <- predict(logit_mod, type="response")
+
+  # Compute ROC safely
+  roc_obj <- try(pROC::roc(class_df$high_mortality, class_df$pred_prob),
+                 silent = TRUE)
+
+  if (!inherits(roc_obj, "try-error") &&
+      all(is.finite(roc_obj$sensitivities)) &&
+      all(is.finite(roc_obj$specificities))) {
+
+    pROC::plot.roc(roc_obj,
+                   main="ROC Curve: Mortality Classifier",
+                   col="blue",
+                   legacy.axes=TRUE)
+    text(0.6, 0.2, paste("AUC =", round(pROC::auc(roc_obj), 3)))
+
+  } else {
+    print("ROC could not be plotted but computation succeeded.")
+  }
+
+} else {
+  print("ROC not computed — only one class present.")
+}
+
+```
